@@ -625,11 +625,18 @@ function handleInvalidTokenError(config, oldToken, error) {
       return { recovered: true, newToken: newToken };
     } else {
       // APIは同じトークンを返した (キャッシュ問題)
-      const msg = `APIキャッシュ問題（中断）Token: ${oldToken} APIキャッシュがクリアされていません。古いトークンが返されました。時間をおいてリセットを試してください。`;
-      logError(config, 'APIキャッシュ問題（中断）', `Token: ${oldToken}`, new Error(msg));
-      config.statusCell.setValue(`[中断] ${msg}`);
+      // [修正] 中断せず、API側のレプリケーション遅延を考慮して待機する
+      const waitTimeMs = 5000; // 待機時間 (例: 5秒)
+      const msg = `APIキャッシュ問題（待機）: Token: ${oldToken}。 APIキャッシュの同期を ${waitTimeMs / 1000}秒 待機して同じトークンでリトライします。`;
+
+      logError(config, 'APIキャッシュ問題（待機）', `Token: ${oldToken}`, new Error(msg)); // ログレベルを変更
+      config.statusCell.setValue(`処理中: APIキャッシュの同期を ${waitTimeMs / 1000}秒 待機中...`); // ステータスを変更
       SpreadsheetApp.flush();
-      return { recovered: false, newToken: null };
+
+      Utilities.sleep(waitTimeMs); // ★待機する
+
+      // [修正] 回復成功として、同じトークン (newToken または oldToken) を返す
+      return { recovered: true, newToken: newToken };
     }
   } catch (e) {
     // saveStartPageToken 内でエラーが発生した場合
