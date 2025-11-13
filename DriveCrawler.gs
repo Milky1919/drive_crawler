@@ -298,11 +298,34 @@ function main_CheckUpdates() {
       // pageTokenを更新
       changesApiParams.pageToken = pageToken;
 
-      response = exponentialBackoff(() => {
-        // (v2.0 修正) 共有ドライブ対応済みのパラメータを使用
-        return Drive.Changes.list(changesApiParams);
-      });
-
+      try {
+        response = exponentialBackoff(() => {
+          // (v2.0 修正) 共有ドライブ対応済みのパラメータを使用
+          return Drive.Changes.list(changesApiParams);
+        });
+      } catch (e) {
+        const errorMsg = e.message.toLowerCase();
+        if (errorMsg.includes('invalid value')) {
+          // [v3.1] Invalid Value 自動回復処理
+          const recoveryResult = handleInvalidTokenError(config, startPageToken, e);
+          if (recoveryResult.recovered) {
+            startPageToken = recoveryResult.newToken; // トークンを更新
+            changesApiParams.startPageToken = startPageToken; // APIパラメータも更新
+            pageToken = null; // ループを最初からやり直す
+            response = null; // responseをリセット
+            continue; // 次のループへ
+          } else {
+            wasInterrupted = true; // 回復失敗
+            break;
+          }
+        } else {
+          // その他のAPIエラー
+          logError(config, 'Changes.list API失敗', `Token: ${pageToken}`, e);
+          config.statusCell.setValue(`[エラー] Changes.list API失敗。詳細はログ(B6)確認。`);
+          wasInterrupted = true;
+          break;
+        }
+      }
 
       if (!response) {
         // APIエラー（バックオフ失敗）
@@ -508,16 +531,22 @@ function resetResumeData() {
  * Changes API の開始トークンを取得し、PropertiesService に保存する
  * (仕様書 5.3.1)
  * (v2.3 修正) includeItemsFromAllDrives: true を追加
+ * (v3.1 修正) 自動回復モード (isRecovery) を追加
+ * @param {object} config 設定オブジェクト
+ * @param {boolean} [isRecovery=false] 自動回復モードか
+ * @returns {string|null} 成功時は新しいトークン、失敗時はnull
  */
-function saveStartPageToken(config) {
+function saveStartPageToken(config, isRecovery = false) {
   try {
     if (!config) {
        config = getConfiguration(); // configが渡されなかった場合 (リセット時など)
-       if (!config) return;
+       if (!config) return null;
     }
     
-    config.statusCell.setValue('処理中: 新しいAPIトークンを取得中...');
-    SpreadsheetApp.flush();
+    if (!isRecovery) {
+      config.statusCell.setValue('処理中: 新しいAPIトークンを取得中...');
+      SpreadsheetApp.flush();
+    }
     
     // (v2.3 修正) 共有ドライブの場合 driveId と includeItemsFromAllDrives が必須
     const apiParams = {
@@ -535,8 +564,11 @@ function saveStartPageToken(config) {
     if (response && response.startPageToken) {
       PropertiesService.getScriptProperties().setProperty(START_PAGE_TOKEN_KEY, response.startPageToken);
       Logger.log(`新しいAPIトークンを保存しました。 Token: ${response.startPageToken} (DriveId: ${config.targetDriveId || 'N/A'})`);
-      config.statusCell.setValue('APIトークンを更新しました。');
-      SpreadsheetApp.flush();
+      if (!isRecovery) {
+        config.statusCell.setValue('APIトークンを更新しました。');
+        SpreadsheetApp.flush();
+      }
+      return response.startPageToken; // [v3.1] 成功時はトークンを返す
     } else {
       throw new Error('APIからトークンが返されませんでした。');
     }
@@ -555,12 +587,81 @@ function saveStartPageToken(config) {
     // [v2.5 修正] config が null でも Logger.log は実行する
     logError(config, 'APIトークン取得失敗', config ? config.targetDriveId : 'N/A', new Error(errorMsg));
     
-    if (config && config.statusCell) {
+    if (config && config.statusCell && !isRecovery) {
       config.statusCell.setValue(`[エラー] ${errorMsg}`);
       SpreadsheetApp.flush();
     }
-    // 呼び出し元 (main_CheckUpdates / resetResumeData) にエラーをスローして停止させる
-    throw new Error(errorMsg);
+
+    if (isRecovery) {
+      // [v3.1] 自動回復モードではエラーをスローせず null を返す
+      return null;
+    } else {
+      // 通常モードではエラーをスローして停止させる
+      throw new Error(errorMsg);
+    }
+  }
+}
+
+
+/**
+ * [v3.1 追加] Invalid Value エラーの自動回復処理
+ * @param {object} config 設定オブジェクト
+ * @param {string} oldToken エラーが発生した古いトークン
+ * @param {Error} error 発生したエラーオブジェクト
+ * @returns {{recovered: boolean, newToken: string|null}} 回復結果
+ */
+function handleInvalidTokenError(config, oldToken, error) {
+  const errorMessage = (error && error.message) ? error.message : String(error);
+  logError(config, 'Invalid Value (pageToken Mismatch)', `Token: ${oldToken} / DriveId: ${config.targetDriveId || 'N/A'}`, new Error(`自動回復処理を開始します。${errorMessage}`));
+
+  try {
+    // 新しいトークンを再取得
+    const newToken = saveStartPageToken(config, true); // isRecovery=true を渡す
+
+    if (newToken && newToken !== oldToken) {
+      Logger.log(`Invalid Valueから回復成功。新しいトークン: ${newToken}`);
+      config.statusCell.setValue('処理中: APIトークンを自動更新し、処理を継続します...');
+      SpreadsheetApp.flush();
+      return { recovered: true, newToken: newToken };
+    } else {
+      // APIは同じトークンを返した (キャッシュ問題)
+      const msg = `APIキャッシュ問題（中断）Token: ${oldToken} APIキャッシュがクリアされていません。古いトークンが返されました。時間をおいてリセットを試してください。`;
+      logError(config, 'APIキャッシュ問題（中断）', `Token: ${oldToken}`, new Error(msg));
+      config.statusCell.setValue(`[中断] ${msg}`);
+      SpreadsheetApp.flush();
+      return { recovered: false, newToken: null };
+    }
+  } catch (e) {
+    // saveStartPageToken 内でエラーが発生した場合
+    logError(config, '自動回復処理失敗', `Token: ${oldToken}`, e);
+    config.statusCell.setValue(`[エラー] 自動回復処理に失敗しました: ${e.message}`);
+    SpreadsheetApp.flush();
+    return { recovered: false, newToken: null };
+  }
+}
+
+
+/**
+ * [v3.1 追加] Drive API の基本的な権限 (drive.readonly) が付与されているか事前チェックする
+ * @returns {boolean} 権限があれば true, なければ false
+ */
+function checkApiPermissions() {
+  try {
+    // 最も軽量な readonly API をテスト呼び出し
+    Drive.About.get({ fields: 'kind' });
+    return true;
+  } catch (e) {
+    const errorMsg = e.message.toLowerCase();
+    // 一般的な権限エラーのキーワード
+    if (errorMsg.includes('authorization') || errorMsg.includes('forbidden') || errorMsg.includes('access denied')) {
+       const msg = '[権限エラー] Drive APIへのアクセスが許可されていません。\n\n' +
+        '【確認してください】\n' +
+        '1. スクリプトが要求するGoogle Driveの権限を許可しましたか？\n' +
+        '2. (Workspace管理者様) ドメイン全体のポリシーでAPIアクセスが制限されていませんか？';
+      SpreadsheetApp.getUi().alert(msg);
+      // getConfiguration内のログで詳細を記録するため、ここではUI表示のみ
+    }
+    return false;
   }
 }
 
@@ -584,6 +685,21 @@ function getConfiguration() {
 
   let config = {};
   try {
+    // [v3.1 追加] API権限の事前チェック
+    if (!checkApiPermissions()) {
+      const error = new Error('Drive APIの権限がありません。スクリプトの実行を中止します。');
+      try {
+        const errorLogSheetName = sheet.getRange('B6').getValue().toString().trim();
+        if (errorLogSheetName) {
+            const errorLogSheet = getOrCreateSheet(ss, errorLogSheetName, ['日時', '発生箇所', '対象ID', 'エラーメッセージ']);
+            errorLogSheet.appendRow([new Date(), 'API権限チェック (getConfiguration)', 'N/A', error.message]);
+        }
+      } catch (logError) {
+        Logger.log(`[致命的エラー] API権限エラーのログ記録に失敗: ${logError.message}`);
+      }
+      return null;
+    }
+
     config = {
       ss: ss,
       startFolderId: extractIdFromUrl(sheet.getRange('B1').getValue().toString().trim()),
