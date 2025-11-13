@@ -266,7 +266,7 @@ function main_CheckUpdates() {
     let newFoldersToWrite = [];
 
     // 2. 変更履歴の取得 (仕様書 5.3.2 2項)
-    let pageToken = startPageToken; // [v3.0 修正] v2.6 のアプローチに戻す (getStartPageToken の値を pageToken として使う)
+    let pageToken = null; // [v3.1 修正] 初回は null で開始
     let newStartPageToken = null;
     let response = null; 
     let wasInterrupted = false; // [v3.0 修正] 終了処理(L382)のバグ修正用フラグ
@@ -275,22 +275,21 @@ function main_CheckUpdates() {
     SpreadsheetApp.flush();
     
     // (v2.0 修正) 共有ドライブの場合 driveId が必須
+    // [v3.1 修正] 初回呼び出しは pageToken: null で開始し、保存したトークンは startPageToken として使用する
     const changesApiParams = {
-      // [v3.0 修正] pageToken (L251) と startPageToken (v2.7 L243) のアプローチを v2.6 に戻す
-      pageToken: pageToken, // [v3.0 修正] L215 で読み込んだトークンは pageToken にセット
+      startPageToken: startPageToken,
       fields: 'nextPageToken, newStartPageToken, changes(fileId, time, removed, file(id, name, mimeType, parents, createdTime, modifiedTime, owners))',
       pageSize: 500,
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
-      // startPageToken: startPageToken // [v3.0 修正] v2.7 のアプローチ (startPageToken の使用) を破棄
     };
     if (config.targetDriveId) {
       changesApiParams.driveId = config.targetDriveId;
     }
 
     // 3. ループ処理 (仕様書 5.3.2 3項)
-    // [v3.0 修正] do...while(pageToken) -> while(pageToken) に戻す
-    while (pageToken) {
+    // [v3.1 修正] do...while に変更し、初回 (pageToken: null) 実行を保証
+    do {
       if (checkTimeLimit()) {
         config.statusCell.setValue('中断 (時間制限): 処理を中断します。');
         SpreadsheetApp.flush();
@@ -298,67 +297,15 @@ function main_CheckUpdates() {
         break; // whileループを抜ける
       }
       
-      // pageTokenを更新
+      // pageTokenをセット (初回は null)
       changesApiParams.pageToken = pageToken;
 
-      try {
-        response = exponentialBackoff(() => {
-          // (v2.0 修正) 共有ドライブ対応済みのパラメータを使用
-          return Drive.Changes.list(changesApiParams);
-        });
-      } catch (e) {
-        // [v3.0 修正] v2.7 のアプローチ (startPageToken Mismatch) ではなく、v2.6 のアプローチ (pageToken Mismatch) に戻す
-        if (e.message.toLowerCase().includes('invalid value')) {
-          // [v2.1 修正] Invalid Value (トークンと driveId の不一致) を検出
-          const errorDetail = `Invalid Value (pageToken Mismatch) / Token: ${pageToken} / DriveId: ${config.targetDriveId || 'N/A'}`;
-          const recoveryMsg = '自動回復処理（トークン再取得）を開始します。';
-          
-          // [v2.5 修正] エラーログに詳細を記録
-          logError(config, `[${errorDetail}] ${recoveryMsg}`, `Token: ${pageToken}`, e);
-          
-          config.statusCell.setValue(`[警告] APIトークンの不一致を検出。${recoveryMsg}`);
-          Logger.log(`[警告] ${errorDetail} ${recoveryMsg}`);
-          
-          // [v2.2 修正] トークン再取得処理 (saveStartPageToken) が失敗する可能性を考慮
-          try {
-            saveStartPageToken(config); 
-          } catch (saveTokenError) {
-            // saveStartPageToken がスローした具体的なエラー（権限不足の示唆など）
-            // logError と statusCell への書き込みは saveStartPageToken 内部で行われる
-            Logger.log(`[致命的エラー] トークンの再取得中にエラーが発生: ${saveTokenError.message}`);
-            throw saveTokenError; // main_CheckUpdates の catch(e) に投げる
-          }
-          
-          const newToken = scriptProperties.getProperty(START_PAGE_TOKEN_KEY);
-          
-          // [v3.0 修正] v2.7 のロジック (startPageToken を更新) ではなく、v2.6 のロジック (pageToken を更新) に戻す
-          if (newToken && newToken !== pageToken) {
-            // 新しいトークンでリトライ
-            changesApiParams.pageToken = newToken;
-            Logger.log(`Retrying Changes.list with new pageToken: ${newToken}`);
-            response = exponentialBackoff(() => {
-              return Drive.Changes.list(changesApiParams);
-            });
-            // メインのpageToken変数にも反映
-            pageToken = newToken; 
-            startPageToken = newToken; // ループ開始時のトークンも更新
-          } else {
-            // [v2.3 修正] トークン再取得失敗、または変わらなかった (APIキャッシュ問題)
-            // v2.2 の throw new Error(...) (致命的エラー) をやめ、安全な中断 (break) に変更
-            const cacheErrorMsg = 'APIキャッシュがクリアされていません。古いトークンが返されました。時間をおいてリセットを試してください。';
-            // [v2.5 修正] エラーログに記録
-            logError(config, 'APIキャッシュ問題（中断）', `Token: ${pageToken}`, new Error(cacheErrorMsg));
-            
-            config.statusCell.setValue(`[中断] ${cacheErrorMsg}`);
-            SpreadsheetApp.flush();
-            wasInterrupted = true; // [v3.0 修正]
-            break; // [v2.3 修正] 無限ループを避けるためループを抜ける (致命的エラーにはしない)
-          }
-        } else {
-          // その他のエラー
-          throw e;
-        }
-      }
+      // [v3.1 修正] Invalid Value が発生しない前提のため、専用の回復ロジックは削除。
+      // 他のAPIエラー（権限など）は exponentialBackoff がスローし、main_CheckUpdates の catch(e) で捕捉される。
+      response = exponentialBackoff(() => {
+        // (v2.0 修正) 共有ドライブ対応済みのパラメータを使用
+        return Drive.Changes.list(changesApiParams);
+      });
 
 
       if (!response) {
@@ -439,7 +386,7 @@ function main_CheckUpdates() {
       }
       pageToken = response.nextPageToken;
 
-    } // while (pageToken)
+    } while (pageToken)
     
     // 4. 終了処理 (仕様書 5.3.2 4項)
     flushUpdateBuffers(config, logsToWrite, newFilesToWrite, newFoldersToWrite);
