@@ -275,7 +275,6 @@ function main_CheckUpdates() {
     SpreadsheetApp.flush();
     
     // (v2.0 修正) 共有ドライブの場合 driveId が必須
-    // [v3.1 修正] 初回呼び出しは pageToken: null で開始し、保存したトークンは startPageToken として使用する
     const changesApiParams = {
       startPageToken: startPageToken,
       fields: 'nextPageToken, newStartPageToken, changes(fileId, time, removed, file(id, name, mimeType, parents, createdTime, modifiedTime, owners))',
@@ -288,7 +287,6 @@ function main_CheckUpdates() {
     }
 
     // 3. ループ処理 (仕様書 5.3.2 3項)
-    // [v3.1 修正] do...while に変更し、初回 (pageToken: null) 実行を保証
     do {
       if (checkTimeLimit()) {
         config.statusCell.setValue('中断 (時間制限): 処理を中断します。');
@@ -297,11 +295,9 @@ function main_CheckUpdates() {
         break; // whileループを抜ける
       }
       
-      // pageTokenをセット (初回は null)
+      // pageTokenを更新
       changesApiParams.pageToken = pageToken;
 
-      // [v3.1 修正] Invalid Value が発生しない前提のため、専用の回復ロジックは削除。
-      // 他のAPIエラー（権限など）は exponentialBackoff がスローし、main_CheckUpdates の catch(e) で捕捉される。
       response = exponentialBackoff(() => {
         // (v2.0 修正) 共有ドライブ対応済みのパラメータを使用
         return Drive.Changes.list(changesApiParams);
@@ -386,7 +382,7 @@ function main_CheckUpdates() {
       }
       pageToken = response.nextPageToken;
 
-    } while (pageToken)
+    } while (pageToken);
     
     // 4. 終了処理 (仕様書 5.3.2 4項)
     flushUpdateBuffers(config, logsToWrite, newFilesToWrite, newFoldersToWrite);
