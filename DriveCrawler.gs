@@ -428,22 +428,39 @@ function main_CheckUpdates() {
 
     } else {
       // 正常完了時 (pageTokenがnullになった)
+
       if (newStartPageToken) {
+        // ★最優先: ループで newStartPageToken が取得できた場合
         scriptProperties.setProperty(START_PAGE_TOKEN_KEY, newStartPageToken);
         const msg = `処理完了: 更新確認が完了しました。(${new Date().toLocaleString('ja-JP')})`;
         config.statusCell.setValue(msg);
         Logger.log(msg);
+
       } else {
-        // 変更が全くなかった場合、newStartPageTokenがnullのことがあるが、
-        // startPageToken (ループ開始時のトークン) は有効なままなので、それを再利用する
-        if (startPageToken) {
-          scriptProperties.setProperty(START_PAGE_TOKEN_KEY, startPageToken);
-           const msg = `処理完了: 変更はありませんでした。(${new Date().toLocaleString('ja-JP')})`;
-           config.statusCell.setValue(msg);
-           Logger.log(msg);
-        } else {
-          logError(config, 'トークン更新失敗', null, new Error('newStartPageTokenが取得できませんでした。'));
-          config.statusCell.setValue('[エラー] 新しいトークンの取得に失敗しました。');
+        // ★次点: ループで newStartPageToken が取得できなかった (null だった) 場合
+        // (Invalid Value からの回復直後や、変更が全くない場合に発生する可能性がある)
+
+        // [v3.2 修正] 古い startPageToken を再保存する とバグになるため、
+        // 強制的に新しいトークンを取得しにいく。
+        Logger.log(`newStartPageToken が null でした。新しいトークンを強制的に再取得します。 (ループ開始時のToken: ${startPageToken})`);
+
+        try {
+          // (isRecovery=false で呼び出し、B4セルにステータスを表示させる)
+          const forcedNewToken = saveStartPageToken(config, false);
+
+          if (forcedNewToken) {
+             const msg = `処理完了: 変更はありませんでした (APIトークンを再取得)。(${new Date().toLocaleString('ja-JP')})`;
+             config.statusCell.setValue(msg);
+             Logger.log(msg);
+          } else {
+             // saveStartPageToken が null を返した場合 (ありえないはずだが)
+             throw new Error('saveStartPageToken が null を返しました。');
+          }
+
+        } catch (e) {
+          // saveStartPageToken がエラーをスローした場合 (ログとB4セル表示は関数内部で実行済み)
+          // 古いトークンは保存しない
+          Logger.log(`トークンの強制再取得に失敗しました。PropertiesService は更新されません。`);
         }
       }
     }
